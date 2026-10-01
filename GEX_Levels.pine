@@ -1,0 +1,291 @@
+//@version=6
+// ════════════════════════════════════════════════════════════════════════════
+//  GEX Levels — NAS100 / XAUUSD / BTCUSD
+//
+//  Pine はオプションの建玉・IV を取得できないため、2段構成で動かす。
+//    ① gex_levels.py が CBOE（QQQ / GLD）と Deribit（BTC）から GEX を計算し、
+//       output/tv_input.txt に1行の文字列を書き出す。
+//    ② その文字列を設定「GEXデータ」に貼ると、このインジケーターがチャートの銘柄に
+//       合うブロックを選び、CFD 価格に換算して描画する。
+//
+//  CFD 換算（スナップショット比率）: 元データの価格時刻のチャート終値 ÷ 元データの現値。
+//  つまり XAUUSD÷GLD、NAS100÷QQQ を貼り付けのたびに取り直す。BTC はほぼ 1.0。
+//
+//  レベル: ガンマフリップ（合計GEXが0を跨ぐ価格）/ コールウォール / プットウォール /
+//          最大ガンマ（ピン）。実線=全満期、破線=直近満期。
+//  ディーラーはコール買い・プット売りの仮定。BTC・ゴールドでは精度が落ちるので参考値。
+// ════════════════════════════════════════════════════════════════════════════
+indicator("GEX Levels", "GEX", overlay = true, max_lines_count = 100, max_labels_count = 100, max_boxes_count = 100)
+
+// ───────────────────────── 入力 ─────────────────────────
+G_DATA = "データ"
+string dataIn      = input.text_area("", "GEXデータ（gex_levels.py の出力を貼り付け）", group = G_DATA)
+string targetIn    = input.string("自動", "対象銘柄", options = ["自動", "NAS100", "XAUUSD", "BTCUSD"], group = G_DATA, tooltip = "自動: チャートのシンボル名（NAS100/US100/USTEC、XAUUSD/GOLD、BTCUSD など）から判定")
+string convIn      = input.string("スナップショット比率", "CFD換算", options = ["スナップショット比率", "手動比率", "換算なし"], group = G_DATA, tooltip = "スナップショット比率: データの価格時刻のチャート終値 ÷ 元データの現値。チャートの履歴がその時刻まで届かないときは手動比率を使います。")
+float manualRatio  = input.float(1.0, "手動比率", minval = 0.0, step = 0.0001, group = G_DATA)
+float staleHrs     = input.float(30, "古いデータの警告（時間）", minval = 1, group = G_DATA)
+
+G_LV = "レベル"
+bool showAll  = input.bool(true, "全満期（実線）", inline = "exp", group = G_LV)
+bool showNear = input.bool(true, "直近満期（破線）", inline = "exp", group = G_LV)
+bool showFlip = input.bool(true, "ガンマフリップ", inline = "lv1", group = G_LV)
+bool showCW   = input.bool(true, "コールウォール", inline = "lv1", group = G_LV)
+bool showPW   = input.bool(true, "プットウォール", inline = "lv2", group = G_LV)
+bool showPin  = input.bool(true, "最大ガンマ（ピン）", inline = "lv2", group = G_LV)
+bool showSrcK = input.bool(true, "ラベルに元のストライクを表示", group = G_LV)
+bool extLeft  = input.bool(false, "線を左端まで延長（オフ: データ時刻から）", group = G_LV)
+bool showBg   = input.bool(true, "ガンマ・レジーム背景（データ時刻以降）", group = G_LV, tooltip = "全満期のフリップより上=正ガンマ（値動きが抑えられやすい）、下=負ガンマ（値動きが拡大しやすい）")
+
+G_PR = "GEXプロファイル"
+bool showProf = input.bool(true, "ストライク別の純GEXを右側に表示", group = G_PR)
+int profW     = input.int(40, "最大の長さ（バー）", minval = 5, maxval = 200, group = G_PR)
+int profOff   = input.int(30, "最新バーからの距離（バー）", minval = 2, maxval = 250, group = G_PR)
+bool profVal  = input.bool(false, "値（$M）を表示", group = G_PR)
+
+G_ST = "スタイル"
+color cFlip    = input.color(#FFB300, "フリップ", inline = "c1", group = G_ST)
+color cCW      = input.color(#26A69A, "コールW", inline = "c1", group = G_ST)
+color cPW      = input.color(#EF5350, "プットW", inline = "c2", group = G_ST)
+color cPin     = input.color(#AB47BC, "ピン", inline = "c2", group = G_ST)
+color cPos     = input.color(color.new(#26A69A, 50), "正GEX", inline = "c3", group = G_ST)
+color cNeg     = input.color(color.new(#EF5350, 50), "負GEX", inline = "c3", group = G_ST)
+int lineW      = input.int(2, "線の太さ（全満期）", minval = 1, maxval = 5, group = G_ST)
+string lblSzIn = input.string("小", "ラベルサイズ", options = ["極小", "小", "中"], group = G_ST)
+int bgTransp   = input.int(93, "背景の透明度", minval = 50, maxval = 100, group = G_ST)
+bool showTbl   = input.bool(true, "情報テーブル", group = G_ST)
+string tblPos  = input.string("右上", "テーブル位置", options = ["右上", "右下", "左上", "左下"], group = G_ST)
+
+// ───────────────────────── 関数 ─────────────────────────
+detectTarget() =>
+    string t = str.upper(syminfo.ticker)
+    string res = ""
+    if str.contains(t, "XAU") or str.contains(t, "GOLD") or str.contains(t, "GLD") or str.startswith(t, "GC") or str.startswith(t, "MGC")
+        res := "XAUUSD"
+    else if str.contains(t, "BTC") or str.contains(t, "XBT")
+        res := "BTCUSD"
+    else if str.contains(t, "NAS") or str.contains(t, "US100") or str.contains(t, "USTEC") or str.contains(t, "TECH100") or str.contains(t, "NDX") or str.contains(t, "QQQ") or str.startswith(t, "NQ") or str.startswith(t, "MNQ")
+        res := "NAS100"
+    res
+
+getNum(map<string, string> m, string k) =>
+    m.contains(k) ? str.tonumber(m.get(k)) : na
+
+getStr(map<string, string> m, string k) =>
+    m.contains(k) ? m.get(k) : ""
+
+// 同じ価格・同じ満期区分のレベルは1本にまとめ、名前を連結する
+addLevel(array<float> P, array<string> N, array<color> C, array<bool> D, float p, string name, color c, bool near) =>
+    if not na(p)
+        int idx = -1
+        for [i, v] in P
+            if math.abs(v - p) < 1e-9 and D.get(i) == near
+                idx := i
+        if idx >= 0
+            N.set(idx, N.get(idx) + "/" + name)
+        else
+            P.push(p)
+            N.push(name)
+            C.push(c)
+            D.push(near)
+
+fmtM(float v) =>
+    na(v) ? "—" : (v >= 0 ? "+" : "") + str.tostring(v, "#,##0.0") + "M$"
+
+fmtP(float v) =>
+    na(v) ? "—" : str.tostring(v, format.mintick)
+
+// ───────────────────────── データ解析（初回バーのみ） ─────────────────────────
+var map<string, string> kv = map.new<string, string>()
+var array<float> profK = array.new<float>()
+var array<float> profV = array.new<float>()
+var string target = ""
+var string status = ""
+var bool found = false
+
+if barstate.isfirst
+    target := targetIn == "自動" ? detectTarget() : targetIn
+    string s = str.replace_all(str.replace_all(dataIn, "\r", ""), "\n", ";")
+    if str.length(str.trim(s)) == 0
+        status := "GEXデータが未入力です（gex_levels.py の出力を貼り付け）"
+    else if target == ""
+        status := "対象銘柄を判定できません（設定で選択してください）"
+    else
+        string names = ""
+        for seg in str.split(s, ";")
+            array<string> parts = str.split(str.trim(seg), "|")
+            string head = parts.size() > 0 ? str.upper(str.replace_all(str.trim(parts.get(0)), " ", "")) : ""
+            if str.startswith(head, "GEX:")
+                names += (names == "" ? "" : ", ") + str.substring(head, 4)
+            if parts.size() > 1 and head == "GEX:" + target
+                found := true
+                kv.clear()
+                for p in parts
+                    int eq = str.pos(p, "=")
+                    if not na(eq) and eq > 0
+                        kv.put(str.trim(str.substring(p, 0, eq)), str.trim(str.substring(p, eq + 1)))
+        string pasted = str.trim(dataIn)
+        string preview = str.length(pasted) > 30 ? str.substring(pasted, 0, 30) + "…" : pasted
+        if names == ""
+            status := "GEXデータの形式が違います（GEX:NAS100|… で始まる文字列を貼ってください）\n貼られた先頭: " + preview
+        else if not found
+            status := "データに " + target + " のブロックがありません（あるのは: " + names + "）"
+        else if kv.contains("prof")
+            for item in str.split(kv.get("prof"), ",")
+                array<string> kvp = str.split(item, ":")
+                if kvp.size() == 2
+                    float k = str.tonumber(kvp.get(0))
+                    float v = str.tonumber(kvp.get(1))
+                    if not na(k) and not na(v)
+                        profK.push(k)
+                        profV.push(v)
+
+var float tsMs  = found ? getNum(kv, "ts") : na
+var float spot  = found ? getNum(kv, "spot") : na
+var string src  = getStr(kv, "src")
+var string exp0 = getStr(kv, "exp0")
+
+// ───────────────────────── CFD 換算比率 ─────────────────────────
+// データの価格時刻を含むバー（なければ直前のバー）の終値を記録する
+var float snapClose = na
+var int snapBar = na
+if not na(tsMs) and time <= tsMs
+    snapClose := close
+    snapBar := bar_index
+
+bool snapOk = not na(snapClose) and not na(spot) and spot > 0
+float ratio = switch convIn
+    "換算なし" => 1.0
+    "手動比率" => manualRatio
+    => snapOk ? snapClose / spot : manualRatio
+string ratioNote = convIn == "スナップショット比率" and not snapOk ? "（データ時刻のバーなし→手動）" : convIn == "スナップショット比率" ? "" : "（" + convIn + "）"
+
+float flipC = getNum(kv, "flip") * ratio
+float cwC   = getNum(kv, "cw") * ratio
+float pwC   = getNum(kv, "pw") * ratio
+float netAll = getNum(kv, "net")
+
+// ───────────────────────── レジーム背景 ─────────────────────────
+bool afterSnap = not na(snapBar) and bar_index >= snapBar
+color bgCol = na
+if showBg and found and afterSnap
+    if not na(flipC)
+        bgCol := close >= flipC ? color.new(cPos, bgTransp) : color.new(cNeg, bgTransp)
+    else if not na(netAll)
+        bgCol := netAll >= 0 ? color.new(cPos, bgTransp) : color.new(cNeg, bgTransp)
+bgcolor(bgCol, title = "ガンマ・レジーム")
+
+// ───────────────────────── 描画（最終バー） ─────────────────────────
+var array<line>  gLines  = array.new<line>()
+var array<label> gLabels = array.new<label>()
+var array<box>   gBoxes  = array.new<box>()
+var table tbl = na
+
+lblSize = switch lblSzIn
+    "極小" => size.tiny
+    "中" => size.normal
+    => size.small
+
+if barstate.islast
+    for l in gLines
+        l.delete()
+    gLines.clear()
+    for lb in gLabels
+        lb.delete()
+    gLabels.clear()
+    for b in gBoxes
+        b.delete()
+    gBoxes.clear()
+
+    if found
+        // ── レベル線 ──
+        array<float>  P = array.new<float>()
+        array<string> N = array.new<string>()
+        array<color>  C = array.new<color>()
+        array<bool>   D = array.new<bool>()
+        for near in array.from(false, true)
+            if near ? showNear : showAll
+                string sfx = near ? "0" : ""
+                if showFlip
+                    addLevel(P, N, C, D, getNum(kv, "flip" + sfx), "フリップ", cFlip, near)
+                if showCW
+                    addLevel(P, N, C, D, getNum(kv, "cw" + sfx), "コールW", cCW, near)
+                if showPW
+                    addLevel(P, N, C, D, getNum(kv, "pw" + sfx), "プットW", cPW, near)
+                if showPin
+                    addLevel(P, N, C, D, getNum(kv, "pin" + sfx), "ピン", cPin, near)
+
+        int x1 = na(snapBar) ? math.max(0, bar_index - 100) : math.max(snapBar, bar_index - 4999)
+        int x2 = bar_index + (showProf ? profOff + profW : 10)
+        string expLbl = str.length(exp0) >= 10 ? str.substring(exp0, 5) : exp0
+        for [i, p] in P
+            bool near = D.get(i)
+            float y = p * ratio
+            color c = C.get(i)
+            gLines.push(line.new(x1, y, x2, y, color = c, width = near ? 1 : lineW, style = near ? line.style_dashed : line.style_solid, extend = extLeft ? extend.left : extend.none))
+            string txt = N.get(i) + (near ? "（" + expLbl + "）" : "") + " " + fmtP(y) + (showSrcK ? "  [" + src + " " + str.tostring(p) + "]" : "")
+            gLabels.push(label.new(bar_index + 2, y, txt, color = #00000000, textcolor = c, style = label.style_label_left, size = lblSize))
+
+        // ── ストライク別 純GEX プロファイル（全満期） ──
+        if showProf and profK.size() > 0
+            float maxAbs = 0.0
+            for v in profV
+                maxAbs := math.max(maxAbs, math.abs(v))
+            float gap = na
+            if profK.size() > 1
+                for i = 1 to profK.size() - 1
+                    float d = profK.get(i) - profK.get(i - 1)
+                    if d > 0
+                        gap := na(gap) ? d : math.min(gap, d)
+            float hh = (na(gap) ? nz(spot, close) * 0.001 : gap * 0.4) * ratio
+            int x0 = bar_index + profOff
+            for [i, k] in profK
+                float v = profV.get(i)
+                int len = maxAbs > 0 ? math.max(1, int(math.round(profW * math.abs(v) / maxAbs))) : 1
+                gBoxes.push(box.new(x0, k * ratio + hh, x0 + len, k * ratio - hh, border_width = 0, bgcolor = v >= 0 ? cPos : cNeg, text = profVal ? str.tostring(v, "#,##0.0") : "", text_size = size.tiny, text_halign = text.align_left, text_color = chart.fg_color))
+
+    // ── 情報テーブル ──
+    if showTbl
+        if na(tbl)
+            pos = switch tblPos
+                "右下" => position.bottom_right
+                "左上" => position.top_left
+                "左下" => position.bottom_left
+                => position.top_right
+            tbl := table.new(pos, 3, 11, bgcolor = color.new(chart.bg_color, 10), border_color = color.new(chart.fg_color, 85), border_width = 1)
+        tbl.clear(0, 0, 2, 10)
+        color fg = chart.fg_color
+        if not found
+            tbl.cell(0, 0, "GEX", text_color = fg, text_size = size.small)
+            tbl.cell(1, 0, status, text_color = color.orange, text_size = size.small)
+        else
+            float ageH = (timenow - tsMs) / 3600000.0
+            bool stale = ageH > staleHrs
+            bool posReg = not na(flipC) ? close >= flipC : nz(netAll) >= 0
+            tbl.cell(0, 0, target + " ← " + src, text_color = fg, text_size = size.small, text_halign = text.align_left)
+            tbl.merge_cells(0, 0, 2, 0)
+            tbl.cell(0, 1, "データ時刻", text_color = fg, text_size = size.small, text_halign = text.align_left)
+            tbl.cell(1, 1, str.format_time(int(tsMs), "MM/dd HH:mm", syminfo.timezone) + "（" + str.tostring(ageH, "#.#") + "時間前）" + (stale ? " ⚠古い" : ""), text_color = stale ? color.orange : fg, text_size = size.small, text_halign = text.align_left)
+            tbl.merge_cells(1, 1, 2, 1)
+            tbl.cell(0, 2, "換算比率", text_color = fg, text_size = size.small, text_halign = text.align_left)
+            tbl.cell(1, 2, str.tostring(ratio, "#.#####") + "  " + src + "=" + str.tostring(spot) + ratioNote, text_color = fg, text_size = size.small, text_halign = text.align_left)
+            tbl.merge_cells(1, 2, 2, 2)
+            tbl.cell(0, 3, "レジーム", text_color = fg, text_size = size.small, text_halign = text.align_left)
+            tbl.cell(1, 3, posReg ? "正ガンマ（値動き抑制）" : "負ガンマ（値動き拡大）", text_color = posReg ? color.new(cPos, 0) : color.new(cNeg, 0), text_size = size.small, text_halign = text.align_left)
+            tbl.merge_cells(1, 3, 2, 3)
+            tbl.cell(0, 4, "", text_size = size.small)
+            tbl.cell(1, 4, "全満期", text_color = fg, text_size = size.small)
+            tbl.cell(2, 4, "直近 " + exp0, text_color = fg, text_size = size.small)
+            array<string> names = array.from("純GEX/1%", "フリップ", "コールW", "プットW", "ピン")
+            array<string> keys  = array.from("net", "flip", "cw", "pw", "pin")
+            for [r, key] in keys
+                tbl.cell(0, 5 + r, names.get(r), text_color = fg, text_size = size.small, text_halign = text.align_left)
+                for col = 0 to 1
+                    float v = getNum(kv, key + (col == 1 ? "0" : ""))
+                    string t = key == "net" ? fmtM(v) : fmtP(v * ratio)
+                    color tc = key == "net" and not na(v) ? (v >= 0 ? color.new(cPos, 0) : color.new(cNeg, 0)) : fg
+                    tbl.cell(1 + col, 5 + r, t, text_color = tc, text_size = size.small, text_halign = text.align_right)
+
+// ───────────────────────── アラート ─────────────────────────
+alertcondition(ta.cross(close, flipC), "ガンマフリップ交差", "{{ticker}} がガンマフリップを交差しました（{{close}}）")
+alertcondition(ta.crossover(close, cwC), "コールウォール上抜け", "{{ticker}} がコールウォールを上抜けました（{{close}}）")
+alertcondition(ta.crossunder(close, pwC), "プットウォール下抜け", "{{ticker}} がプットウォールを下抜けました（{{close}}）")

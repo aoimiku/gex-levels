@@ -1,0 +1,6 @@
+# 手元で実行したときの出力（クラウドの結果は data/ に入る）
+/output/
+/history/
+GEX_Levels_pine.txt
+__pycache__/
+.DS_Store

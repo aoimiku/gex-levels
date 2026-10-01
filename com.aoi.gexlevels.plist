@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.aoi.gexlevels</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/aoi/インジケーター開発/GEX/run_gex.sh</string>
+    </array>
+    <!-- 毎時5分に3銘柄を更新（BTCは24時間、CBOEは引け後・週末は同じデータなので履歴に重複保存されない） -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Minute</key>
+        <integer>5</integer>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
